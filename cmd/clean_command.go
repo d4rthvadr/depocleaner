@@ -7,6 +7,7 @@ import (
 	"github.com/d4rthvadr/node-cleaner/internal/cache"
 	"github.com/d4rthvadr/node-cleaner/internal/cleaner"
 	"github.com/d4rthvadr/node-cleaner/internal/config"
+	"github.com/d4rthvadr/node-cleaner/internal/logger"
 	"github.com/d4rthvadr/node-cleaner/internal/scanner"
 	"github.com/d4rthvadr/node-cleaner/internal/ui"
 	"github.com/spf13/cobra"
@@ -99,9 +100,16 @@ func runClean(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	//logger := initLogger()
+	// Initialize logger
+	log, err := logger.New(cfg.LogPath, logger.DefaultLogLevel)
+	if err != nil {
+		return fmt.Errorf("initializing logger: %w", err)
+	}
+	defer log.Close()
 
-	cl := cleaner.NewCleaner(dryRun, nil)
+	// Wrap logger with adapter for cleaner component
+	cleanerLogger := logger.NewAdapter(log)
+	cl := cleaner.NewCleaner(dryRun, cleanerLogger)
 
 	cleanResult, err := cl.Clean(ctx, selected)
 

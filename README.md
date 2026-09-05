@@ -17,6 +17,8 @@ DepoCleaner scans for dependency folders in these stacks:
 - Smart scanning across supported ecosystems
 - Fast, concurrent worker pool
 - Caching to skip unchanged directories
+- Interactive selection UI for safe cleanup
+- Dry-run mode to preview deletions
 - Clear, colorful terminal output
 - Safe by design: preview, confirm, then act
 
@@ -61,6 +63,32 @@ Run the CLI (defaults use config at $HOME/.depocleaner/config.yaml):
 ./depo-cleaner --workers 4 scan --no-cache /path/to/projects
 ```
 
+### Clean
+
+Interactive clean with selection UI:
+
+```bash
+# Scan and interactively select folders to delete
+./depo-cleaner clean
+
+# Clean a specific path
+./depo-cleaner clean /path/to/projects
+
+# Preview what would be deleted without actually deleting (dry run)
+./depo-cleaner clean --dry-run
+
+# Combine options
+./depo-cleaner --workers 8 clean --dry-run /path/to/projects
+```
+
+The clean command workflow:
+
+1. Scans for dependency folders
+2. Presents interactive selection UI (use Space to toggle, Enter to confirm)
+3. Shows confirmation prompt with total size
+4. Safely deletes selected folders
+5. Reports results with space reclaimed
+
 ### Config
 
 DepoCleaner uses Viper. Configuration priority is: flags > env vars > config file > defaults.
@@ -88,7 +116,8 @@ Inspect or reset the cache:
 2. Checks cache validity by modification time
 3. Analyzes size and metadata (concurrently)
 4. Streams results to the UI formatter
-5. Enables optional interactive selection (planned)
+5. Interactive selection via Bubble Tea TUI (clean command)
+6. Safe deletion with confirmation and detailed reporting
 
 ## Safety First
 

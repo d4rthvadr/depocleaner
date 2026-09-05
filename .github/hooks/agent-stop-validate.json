@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "cd \"$PWD\" && make test && make fmt",
+        "timeout": 120
+      }
+    ]
+  }
+}

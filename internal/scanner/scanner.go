@@ -17,7 +17,7 @@ type Scanner struct {
 	config    *models.Config
 	cache     CacheProvider
 	results   chan models.DependencyFolder
-	errors    chan error
+	errorChan chan error
 	analyzer  *analyzer.Analyzer
 	workQueue chan string
 }
@@ -32,11 +32,11 @@ type CacheProvider interface {
 // NewScanner creates a new Scanner instance
 func NewScanner(cfg *models.Config, cache CacheProvider) *Scanner {
 	return &Scanner{
-		analyzer: analyzer.NewAnalyzer(),
-		config:   cfg,
-		cache:    cache,
-		results:  make(chan models.DependencyFolder, 100), // buffered to prevent blocking
-		errors:   make(chan error, 50),                    // buffered for errors
+		analyzer:  analyzer.NewAnalyzer(),
+		config:    cfg,
+		cache:     cache,
+		results:   make(chan models.DependencyFolder, 100), // buffered to prevent blocking
+		errorChan: make(chan error, 50),                    // buffered for errors
 	}
 }
 
@@ -65,8 +65,9 @@ func (s *Scanner) Scan(ctx context.Context, rootPath string) (*models.ScanResult
 
 	go func() {
 		if err := s.walkFileSystem(ctx, rootPath, 0); err != nil {
-			s.errors <- fmt.Errorf("walking filesystem: %w", err)
-			fmt.Printf("error occured %v", err)
+			s.errorChan <- fmt.Errorf("walking filesystem: %w", err)
+			s.handleError(fmt.Errorf("error occured %v", err), rootPath)
+
 		}
 		fmt.Println("file system walk completed")
 		close(s.workQueue)
@@ -75,13 +76,13 @@ func (s *Scanner) Scan(ctx context.Context, rootPath string) (*models.ScanResult
 	go func() {
 		wg.Wait()
 		close(s.results)
-		close(s.errors)
+		close(s.errorChan)
 	}()
 
 	done := make(chan struct{})
 
 	go func() {
-		for err := range s.errors {
+		for err := range s.errorChan {
 			// Log errors (could be aggregated or handled differently)
 			fmt.Printf("Scan error: %v\n", err)
 		}
@@ -121,7 +122,7 @@ func (s *Scanner) walkFileSystem(ctx context.Context, rootPath string, depth int
 		}
 
 		if err != nil {
-			s.errors <- fmt.Errorf("accessing %s: %w", path, err)
+			s.errorChan <- fmt.Errorf("accessing %s: %w", path, err)
 			return fs.SkipDir // skip this directory on error but keep walking
 		}
 
@@ -183,7 +184,7 @@ func (s *Scanner) enqueueAndAnalysis(path string) {
 
 		folder, err := s.analyzer.Analyze(path)
 		if err != nil {
-			s.errors <- fmt.Errorf("analyzing %s: %w", path, err)
+			s.handleError(fmt.Errorf("analyzing %s: %w", path, err), path)
 			return
 		}
 		s.results <- *folder
@@ -207,7 +208,7 @@ func (s *Scanner) worker(ctx context.Context, wg *sync.WaitGroup) {
 
 			folder, err := s.analyzer.Analyze(path)
 			if err != nil {
-				s.errors <- fmt.Errorf("analyzing %s: %w", path, err)
+				s.handleError(fmt.Errorf("analyzing %s: %w", path, err), path)
 				continue
 			}
 

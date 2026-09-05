@@ -47,11 +47,21 @@ func (c *Cleaner) Clean(ctx context.Context, folders []models.DependencyFolder) 
 					Reason: err.Error(),
 				})
 				mu.Unlock()
+
+				// Log deletion failure
+				if c.logger != nil {
+					c.logger.Error("Failed to delete folder", "path", f.Path, "error", err)
+				}
 			} else {
 				mu.Lock()
 				result.DeletedFolders = append(result.DeletedFolders, f.Path)
 				result.SpaceReclaimed += f.Size
 				mu.Unlock()
+
+				// Log successful deletion
+				if c.logger != nil {
+					c.logger.Info("Deleted folder", "path", f.Path, "size", f.Size)
+				}
 			}
 		}(folder)
 	}
@@ -64,12 +74,16 @@ func (c *Cleaner) Clean(ctx context.Context, folders []models.DependencyFolder) 
 func (c *Cleaner) deleteFolder(ctx context.Context, path string) error {
 
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		// c.logger.Info("Folder does not exist, skipping", "path", path)
+		if c.logger != nil {
+			c.logger.Info("Folder does not exist, skipping", "path", path)
+		}
 		return fmt.Errorf("path no longer exists")
 	}
 
 	if c.dryRun {
-		// c.logger.Info("Dry run: skipping deletion", "path", path)
+		if c.logger != nil {
+			c.logger.Info("DRY RUN: Would delete", "path", path)
+		}
 		return nil
 	}
 

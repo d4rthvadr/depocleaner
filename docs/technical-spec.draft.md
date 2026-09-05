@@ -280,34 +280,42 @@ package scanner
 
 import (
     "context"
+    "fmt"
     "path/filepath"
     "sync"
+    "time"
 
     "github.com/yourusername/nodecleaner/pkg/models"
+    "github.com/yourusername/nodecleaner/internal/analyzer"
 )
 
 type Scanner struct {
-    config  *models.Config
-    cache   CacheProvider
-    filter  *Filter
-    results chan models.DependencyFolder
-    errors  chan error
+    config    *models.Config
+    cache     CacheProvider
+    filter    *Filter
+    analyzer  *analyzer.Analyzer
+    workQueue chan string
+    results   chan models.DependencyFolder
+    errors    chan error
 }
 
 // CacheProvider abstracts cache operations
 type CacheProvider interface {
     Get(path string) (*models.CacheEntry, bool)
     Set(path string, entry models.CacheEntry) error
+    IsValid(path string, modTime time.Time) bool
 }
 
 // NewScanner creates a configured scanner
 func NewScanner(cfg *models.Config, cache CacheProvider) *Scanner {
     return &Scanner{
-        config:  cfg,
-        cache:   cache,
-        filter:  NewFilter(cfg.IgnorePaths),
-        results: make(chan models.DependencyFolder, 100),
-        errors:  make(chan error, 10),
+        config:    cfg,
+        cache:     cache,
+        filter:    NewFilter(cfg.IgnorePaths),
+        analyzer:  analyzer.NewAnalyzer(),
+        workQueue: make(chan string, cfg.Workers*2),
+        results:   make(chan models.DependencyFolder, 100),
+        errors:    make(chan error, 10),
     }
 }
 
@@ -326,23 +334,32 @@ func (s *Scanner) Scan(ctx context.Context, rootPath string) (*models.ScanResult
         go s.worker(ctx, &wg)
     }
 
-    // Walk filesystem
+    // Walk filesystem in a goroutine
     go func() {
-        defer close(s.results)
-        s.walk(ctx, rootPath, 0)
+        if err := s.walk(ctx, rootPath); err != nil {
+            s.handleError(fmt.Errorf("walking filesystem: %w", err), rootPath)
+        }
+        close(s.workQueue) // Signal workers to finish
     }()
 
-    // Collect results
+    // Wait for workers to complete and close channels
     go func() {
         wg.Wait()
+        close(s.results)
         close(s.errors)
     }()
 
-    // Aggregate
+    // Aggregate results
     for folder := range s.results {
         result.Folders = append(result.Folders, folder)
         result.TotalSize += folder.Size
         result.TotalCount++
+    }
+
+    // Collect and handle errors using handleError method
+    for err := range s.errors {
+        // Log errors (could be aggregated or handled differently)
+        fmt.Printf("Scan error: %v\n", err)
     }
 
     result.Duration = time.Since(result.ScanTime)
@@ -350,14 +367,68 @@ func (s *Scanner) Scan(ctx context.Context, rootPath string) (*models.ScanResult
 }
 
 // walk recursively traverses directories
-func (s *Scanner) walk(ctx context.Context, path string, depth int) {
-    // Implementation in next section
+func (s *Scanner) walk(ctx context.Context, rootPath string) error {
+    // Implementation in section 6.1
+    return nil
 }
 
-// worker processes discovered directories
+// worker processes directories from the work queue
 func (s *Scanner) worker(ctx context.Context, wg *sync.WaitGroup) {
     defer wg.Done()
-    // Implementation in next section
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case path, ok := <-s.workQueue:
+            if !ok {
+                return // Channel closed
+            }
+
+            // Analyze the directory
+            folder, err := s.analyzer.Analyze(path)
+            if err != nil {
+                s.errors <- fmt.Errorf("analyzing %s: %w", path, err)
+                continue
+            }
+
+            // Cache the result
+            if s.cache != nil {
+                cacheEntry := models.CacheEntry{
+                    Path:     path,
+                    Size:     folder.Size,
+                    ModTime:  folder.ModTime,
+                    LastScan: time.Now(),
+                }
+                s.cache.Set(path, cacheEntry)
+            }
+
+            // Send result
+            select {
+            case s.results <- *folder:
+            case <-ctx.Done():
+                return
+            }
+        }
+    }
+}
+
+// isTargetDir checks if directory name is a dependency folder
+func (s *Scanner) isTargetDir(name string) bool {
+    targetDirs := []string{
+        "node_modules", // JavaScript/TypeScript
+        "vendor",       // Go/PHP
+        ".venv",        // Python virtual environment
+        "venv",         // Python virtual environment
+        "target",       // Rust/Java
+    }
+
+    for _, target := range targetDirs {
+        if name == target {
+            return true
+        }
+    }
+    return false
 }
 ```
 
@@ -886,7 +957,7 @@ func runClean(cmd *cobra.Command, args []string) error {
     }
 
     // Perform deletion
-    logger := initLogger()
+    logger := initLogger(cfg.LogPath)
     cl := cleaner.NewCleaner(dryRun, logger)
 
     cleanResult, err := cl.Clean(ctx, selected)
@@ -898,6 +969,39 @@ func runClean(cmd *cobra.Command, args []string) error {
     ui.DisplayCleanResults(cleanResult)
 
     return nil
+}
+
+// initLogger initializes the zap structured logger
+func initLogger(logPath string) *zap.SugaredLogger {
+    // Ensure log directory exists
+    logDir := filepath.Dir(logPath)
+    if err := os.MkdirAll(logDir, 0755); err != nil {
+        fmt.Fprintf(os.Stderr, "Warning: failed to create log directory: %v\n", err)
+        // Fall back to console-only logging
+        logger, _ := zap.NewProduction()
+        return logger.Sugar()
+    }
+
+    // Configure zap logger
+    cfg := zap.NewProductionConfig()
+    cfg.OutputPaths = []string{
+        logPath,      // Write to file
+        "stdout",     // Also write to console
+    }
+    cfg.ErrorOutputPaths = []string{
+        logPath,
+        "stderr",
+    }
+    cfg.Encoding = "json"
+    cfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
+
+    logger, err := cfg.Build()
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "Warning: failed to initialize logger: %v\n", err)
+        logger, _ = zap.NewProduction()
+    }
+
+    return logger.Sugar()
 }
 
 func runCacheClear(cmd *cobra.Command, args []string) error {
@@ -1773,6 +1877,9 @@ func (c *Cleaner) Clean(ctx context.Context, folders []models.DependencyFolder) 
         DryRun: c.dryRun,
     }
 
+    // Note: mu and wg are local to this function call, not struct fields.
+    // This allows multiple Clean operations to run concurrently without
+    // interfering with each other. Each operation gets its own synchronization primitives.
     var mu sync.Mutex
     var wg sync.WaitGroup
 
@@ -1827,79 +1934,674 @@ func (c *Cleaner) deleteFolder(ctx context.Context, path string) error {
 }
 ```
 
+### 5.6 Config Package
+
+**Purpose**: Configuration management using Viper
+
+```go
+// internal/config/config.go
+
+package config
+
+import (
+    "fmt"
+    "os"
+    "path/filepath"
+
+    "github.com/spf13/viper"
+    "github.com/yourusername/nodecleaner/pkg/models"
+)
+
+var (
+    globalConfig *models.Config
+    configPath   string
+)
+
+// Init initializes Viper configuration
+func Init(cfgFile string) error {
+    if cfgFile != "" {
+        // Use config file from flag
+        viper.SetConfigFile(cfgFile)
+    } else {
+        // Search for config in standard locations
+        home, err := os.UserHomeDir()
+        if err != nil {
+            return fmt.Errorf("getting home directory: %w", err)
+        }
+
+        configDir := filepath.Join(home, ".nodecleaner")
+
+        // Create config directory if it doesn't exist
+        if err := os.MkdirAll(configDir, 0755); err != nil {
+            return fmt.Errorf("creating config directory: %w", err)
+        }
+
+        viper.AddConfigPath(configDir)
+        viper.AddConfigPath(".")
+        viper.SetConfigName("config")
+        viper.SetConfigType("yaml")
+
+        configPath = filepath.Join(configDir, "config.yaml")
+    }
+
+    // Set defaults
+    setDefaults()
+
+    // Enable environment variable support
+    viper.SetEnvPrefix("NODECLEANER")
+    viper.AutomaticEnv()
+
+    // Read config file
+    if err := viper.ReadInConfig(); err != nil {
+        if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+            // Config file not found; create with defaults
+            if err := SaveDefaults(); err != nil {
+                return fmt.Errorf("creating default config: %w", err)
+            }
+        } else {
+            return fmt.Errorf("reading config: %w", err)
+        }
+    }
+
+    // Unmarshal into global config
+    globalConfig = &models.Config{}
+    if err := viper.Unmarshal(globalConfig); err != nil {
+        return fmt.Errorf("unmarshaling config: %w", err)
+    }
+
+    return nil
+}
+
+// setDefaults sets default configuration values
+func setDefaults() {
+    home, _ := os.UserHomeDir()
+    configDir := filepath.Join(home, ".nodecleaner")
+
+    viper.SetDefault("scan_path", home)
+    viper.SetDefault("cache_path", filepath.Join(configDir, "cache.json"))
+    viper.SetDefault("log_path", filepath.Join(configDir, "nodecleaner.log"))
+    viper.SetDefault("follow_symlinks", false)
+    viper.SetDefault("max_depth", 10)
+    viper.SetDefault("workers", 4)
+    viper.SetDefault("ignore_paths", []string{
+        "/System",
+        "/Library",
+        "/Applications",
+        "/private/var",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/.Trash",
+        "/Network",
+    })
+}
+
+// Load returns the current configuration
+func Load() *models.Config {
+    if globalConfig == nil {
+        globalConfig = &models.Config{
+            Workers:  viper.GetInt("workers"),
+            MaxDepth: viper.GetInt("max_depth"),
+        }
+        home, _ := os.UserHomeDir()
+        configDir := filepath.Join(home, ".nodecleaner")
+        globalConfig.CachePath = filepath.Join(configDir, "cache.json")
+        globalConfig.LogPath = filepath.Join(configDir, "nodecleaner.log")
+    }
+    return globalConfig
+}
+
+// Set updates a configuration value
+func Set(key string, value interface{}) error {
+    viper.Set(key, value)
+
+    // Update global config
+    if globalConfig != nil {
+        if err := viper.Unmarshal(globalConfig); err != nil {
+            return fmt.Errorf("updating config: %w", err)
+        }
+    }
+
+    return nil
+}
+
+// Save persists current configuration to disk
+func Save() error {
+    if configPath == "" {
+        home, _ := os.UserHomeDir()
+        configPath = filepath.Join(home, ".nodecleaner", "config.yaml")
+    }
+
+    return viper.WriteConfigAs(configPath)
+}
+
+// SaveDefaults creates a config file with default values
+func SaveDefaults() error {
+    home, _ := os.UserHomeDir()
+    configDir := filepath.Join(home, ".nodecleaner")
+    configPath = filepath.Join(configDir, "config.yaml")
+
+    if err := os.MkdirAll(configDir, 0755); err != nil {
+        return err
+    }
+
+    return viper.SafeWriteConfigAs(configPath)
+}
+
+// GetString retrieves a string configuration value
+func GetString(key string) string {
+    return viper.GetString(key)
+}
+
+// GetInt retrieves an integer configuration value
+func GetInt(key string) int {
+    return viper.GetInt(key)
+}
+
+// GetBool retrieves a boolean configuration value
+func GetBool(key string) bool {
+    return viper.GetBool(key)
+}
+
+// GetStringSlice retrieves a string slice configuration value
+func GetStringSlice(key string) []string {
+    return viper.GetStringSlice(key)
+}
+
+// Display prints current configuration
+func Display() {
+    fmt.Println("Current Configuration:")
+    fmt.Println("=====================")
+
+    allSettings := viper.AllSettings()
+    for key, value := range allSettings {
+        fmt.Printf("%s: %v\n", key, value)
+    }
+}
+
+// Reset restores default configuration
+func Reset() error {
+    // Clear all settings
+    for key := range viper.AllSettings() {
+        viper.Set(key, nil)
+    }
+
+    // Reapply defaults
+    setDefaults()
+
+    // Save to file
+    return SaveDefaults()
+}
+```
+
+### 5.7 Logger Package
+
+**Purpose**: Structured logging with Zap
+
+```go
+// internal/logger/logger.go
+
+package logger
+
+import (
+    "fmt"
+    "os"
+    "path/filepath"
+
+    "go.uber.org/zap"g
+    "go.uber.org/zap/zapcore"
+)
+
+// Logger wraps zap.SugaredLogger
+type Logger struct {
+    *zap.SugaredLogger
+}
+
+// New creates a new logger instance
+func New(logPath string, level string) (*Logger, error) {
+    // Ensure log directory exists
+    logDir := filepath.Dir(logPath)
+    if err := os.MkdirAll(logDir, 0755); err != nil {
+        return nil, fmt.Errorf("creating log directory: %w", err)
+    }
+
+    // Parse log level
+    logLevel, err := zapcore.ParseLevel(level)
+    if err != nil {
+        logLevel = zapcore.InfoLevel
+    }
+
+    // Configure zap logger
+    cfg := zap.NewProductionConfig()
+    cfg.OutputPaths = []string{
+        logPath,  // Write to file
+        "stdout", // Also write to console
+    }
+    cfg.ErrorOutputPaths = []string{
+        logPath,
+        "stderr",
+    }
+    cfg.Encoding = "json"
+    cfg.Level = zap.NewAtomicLevelAt(logLevel)
+
+    // Customize time encoding for better readability
+    cfg.EncoderConfig.TimeKey = "timestamp"
+    cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+
+    logger, err := cfg.Build()
+    if err != nil {
+        return nil, fmt.Errorf("building logger: %w", err)
+    }
+
+    return &Logger{logger.Sugar()}, nil
+}
+
+// NewConsoleOnly creates a console-only logger (for testing)
+func NewConsoleOnly() *Logger {
+    logger, _ := zap.NewDevelopment()
+    return &Logger{logger.Sugar()}
+}
+
+// WithFields returns a logger with additional context fields
+func (l *Logger) WithFields(fields map[string]interface{}) *Logger {
+    var zapFields []interface{}
+    for k, v := range fields {
+        zapFields = append(zapFields, k, v)
+    }
+    return &Logger{l.SugaredLogger.With(zapFields...)}
+}
+
+// Close flushes any buffered log entries
+func (l *Logger) Close() error {
+    return l.Sync()
+}
+```
+
+**Logger Interface Adapter**:
+
+```go
+// internal/logger/adapter.go
+
+package logger
+
+// Adapter makes Logger compatible with cleaner.Logger interface
+type Adapter struct {
+    logger *Logger
+}
+
+// NewAdapter creates a logger adapter
+func NewAdapter(logger *Logger) *Adapter {
+    return &Adapter{logger: logger}
+}
+
+// Info logs an info message
+func (a *Adapter) Info(msg string, fields ...interface{}) {
+    a.logger.Infow(msg, fields...)
+}
+
+// Error logs an error message
+func (a *Adapter) Error(msg string, fields ...interface{}) {
+    a.logger.Errorw(msg, fields...)
+}
+
+// Warn logs a warning message
+func (a *Adapter) Warn(msg string, fields ...interface{}) {
+    a.logger.Warnw(msg, fields...)
+}
+```
+
+### 5.8 Logger Usage Guidelines
+
+**When to Use the Adapter:**
+
+The Logger Adapter is used to bridge different logging interface requirements across components:
+
+**Scanner Component:**
+
+- Uses `logger.Logger` directly (returns `*Logger` from `New()`)
+- Scanner.Logger interface requires: `Info`, `Error`, `Warn`, `Debug` methods
+- Pass the logger directly without wrapping
+
+```go
+// In command implementation
+logger, err := logger.New(cfg.LogPath, "info")
+if err != nil {
+    return err
+}
+defer logger.Close()
+
+// Pass directly to Scanner
+scanner := scanner.NewScanner(cfg, cache, logger)
+```
+
+**Cleaner Component:**
+
+- Uses `logger.Adapter` to wrap the logger
+- Cleaner.Logger interface requires only: `Info`, `Error` methods
+- Wrap with `NewAdapter()` for interface compatibility
+
+```go
+// Create base logger
+logger, err := logger.New(cfg.LogPath, "info")
+if err != nil {
+    return err
+}
+
+// Wrap for Cleaner
+cleanerLogger := logger.NewAdapter(logger)
+cleaner := cleaner.NewCleaner(dryRun, cleanerLogger)
+```
+
+**Testing:**
+
+- Create mock loggers that implement the required interface
+- Use Adapter when needed for interface compatibility
+
+```go
+type mockLogger struct{}
+
+func (m *mockLogger) Info(msg string, fields ...interface{})  {}
+func (m *mockLogger) Error(msg string, fields ...interface{}) {}
+func (m *mockLogger) Warn(msg string, fields ...interface{})  {}
+
+// Use directly or wrap with Adapter as needed
+```
+
+**Key Design Benefits:**
+
+1. **Interface Segregation**: Components only depend on methods they actually use
+2. **Flexibility**: Easy to swap implementations without affecting components
+3. **Testability**: Mock loggers can be minimal and focused
+4. **Maintainability**: Changes to logging don't cascade through all components
+
+**Configuration File Example** (`~/.nodecleaner/config.yaml`):
+
+```yaml
+# NodeCleaner Configuration
+
+# Default scan path (defaults to $HOME if not specified)
+scan_path: /Users/username
+
+# Cache file location
+cache_path: /Users/username/.nodecleaner/cache.json
+
+# Log file location
+log_path: /Users/username/.nodecleaner/nodecleaner.log
+
+# Follow symbolic links during scan
+follow_symlinks: false
+
+# Maximum directory depth to traverse (0 = unlimited)
+max_depth: 10
+
+# Number of concurrent worker goroutines
+workers: 4
+
+# Paths to ignore during scanning
+ignore_paths:
+  - /System
+  - /Library
+  - /Applications
+  - /private/var
+  - /dev
+  - /proc
+  - /sys
+  - /.Trash
+  - /Network
+```
+
+### 5.9 Configuration Priority
+
+Viper follows this configuration priority (highest to lowest):
+
+1. **Command-line flags**: `--workers 8`
+2. **Environment variables**: `NODECLEANER_WORKERS=8`
+3. **Config file**: `config.yaml`
+4. **Default values**: Built-in defaults
+
+**Example Environment Variables**:
+
+```bash
+# Set custom scan path
+export NODECLEANER_SCAN_PATH=/Users/dev/projects
+
+# Set number of workers
+export NODECLEANER_WORKERS=8
+
+# Disable symlink following
+export NODECLEANER_FOLLOW_SYMLINKS=false
+
+# Run with environment variables
+nodecleaner scan
+```
+
+### 5.10 Config Management Commands
+
+```go
+// cmd/nodecleaner/config_commands.go
+
+var configCmd = &cobra.Command{
+    Use:   "config",
+    Short: "Manage configuration",
+}
+
+var configShowCmd = &cobra.Command{
+    Use:   "show",
+    Short: "Display current configuration",
+    RunE: func(cmd *cobra.Command, args []string) error {
+        config.Display()
+        return nil
+    },
+}
+
+var configSetCmd = &cobra.Command{
+    Use:   "set [key=value]",
+    Short: "Set configuration value",
+    Args:  cobra.ExactArgs(1),
+    RunE: func(cmd *cobra.Command, args []string) error {
+        parts := strings.SplitN(args[0], "=", 2)
+        if len(parts) != 2 {
+            return fmt.Errorf("invalid format, use key=value")
+        }
+
+        key, value := parts[0], parts[1]
+
+        // Parse value based on expected type
+        if err := config.Set(key, parseValue(value)); err != nil {
+            return err
+        }
+
+        if err := config.Save(); err != nil {
+            return fmt.Errorf("saving config: %w", err)
+        }
+
+        fmt.Printf("Set %s = %s\n", key, value)
+        return nil
+    },
+}
+
+var configResetCmd = &cobra.Command{
+    Use:   "reset",
+    Short: "Reset configuration to defaults",
+    RunE: func(cmd *cobra.Command, args []string) error {
+        if err := config.Reset(); err != nil {
+            return fmt.Errorf("resetting config: %w", err)
+        }
+
+        fmt.Println("Configuration reset to defaults")
+        return nil
+    },
+}
+
+func init() {
+    configCmd.AddCommand(configShowCmd)
+    configCmd.AddCommand(configSetCmd)
+    configCmd.AddCommand(configResetCmd)
+    rootCmd.AddCommand(configCmd)
+}
+
+// parseValue attempts to parse string value to appropriate type
+func parseValue(value string) interface{} {
+    // Try boolean
+    if value == "true" || value == "false" {
+        return value == "true"
+    }
+
+    // Try integer
+    if i, err := strconv.Atoi(value); err == nil {
+        return i
+    }
+
+    // Default to string
+    return value
+}
+```
+
 ---
 
 ## 6. Algorithms & Logic
 
 ### 6.1 Filesystem Traversal Algorithm
 
-**Approach**: Breadth-First Search (BFS) with early termination
+**Approach**: Depth-First Search using `filepath.WalkDir` (Go 1.16+)
+
+**Why `filepath.WalkDir`:**
+
+- More efficient than manual recursion (uses `fs.DirEntry` avoiding extra syscalls)
+- Built-in depth-first traversal
+- Better error handling with `SkipDir` and `SkipAll`
+- Standard library implementation (battle-tested)
+- Lower memory footprint
 
 ```go
 // internal/scanner/walker.go
 
-func (s *Scanner) walk(ctx context.Context, path string, depth int) {
-    // Respect max depth
-    if s.config.MaxDepth > 0 && depth > s.config.MaxDepth {
-        return
-    }
+package scanner
 
-    // Check context cancellation
-    select {
-    case <-ctx.Done():
-        return
-    default:
-    }
+import (
+    "context"
+    "fmt"
+    "io/fs"
+    "path/filepath"
 
-    // Check if path should be ignored
-    if s.filter.ShouldIgnore(path) {
-        return
-    }
+    "github.com/yourusername/nodecleaner/pkg/models"
+)
 
-    entries, err := os.ReadDir(path)
-    if err != nil {
-        s.errors <- fmt.Errorf("reading %s: %w", path, err)
-        return
-    }
+func (s *Scanner) walk(ctx context.Context, rootPath string) error {
+    pathDepths := make(map[string]int)
+    pathDepths[rootPath] = 0
 
-    for _, entry := range entries {
-        if !entry.IsDir() {
-            continue
+    return filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
+        // Check context cancellation
+        select {
+        case <-ctx.Done():
+            return fs.SkipAll // Go 1.20+ - stops entire traversal
+        default:
         }
 
-        fullPath := filepath.Join(path, entry.Name())
+        // Handle walk errors
+        if err != nil {
+            s.errors <- fmt.Errorf("accessing %s: %w", path, err)
+            return fs.SkipDir // Skip this directory but continue walk
+        }
 
-        // Check if this is a target directory
-        if s.isTargetDir(entry.Name()) {
+        // Only process directories
+        if !d.IsDir() {
+            return nil
+        }
+
+        // Calculate current depth
+        parentDepth := pathDepths[filepath.Dir(path)]
+        currentDepth := parentDepth + 1
+        pathDepths[path] = currentDepth
+
+        // Respect max depth
+        if s.config.MaxDepth > 0 && currentDepth > s.config.MaxDepth {
+            return fs.SkipDir
+        }
+
+        // Check if path should be ignored
+        if s.filter.ShouldIgnore(path) {
+            return fs.SkipDir
+        }
+
+        // Check if this is a target directory (e.g., node_modules)
+        if s.isTargetDir(d.Name()) {
             // Check cache first
-            info, _ := entry.Info()
-            if s.cache != nil && s.cache.IsValid(fullPath, info.ModTime()) {
+            info, _ := d.Info()
+
+            if s.cache != nil && s.cache.IsValid(path, info.ModTime()) {
                 // Use cached data
-                cached, _ := s.cache.Get(fullPath)
+                cached, _ := s.cache.Get(path)
                 s.results <- models.DependencyFolder{
-                    Path:       fullPath,
+                    Path:       path,
                     Size:       cached.Size,
                     ModTime:    cached.ModTime,
-                    AccessTime: cached.ModTime, // Approximation
-                    Type:       s.detectType(entry.Name()),
+                    AccessTime: cached.ModTime,
+                    Type:       s.detectType(d.Name()),
                 }
-                continue
+            } else {
+                // Queue for analysis
+                s.queueAnalysis(path)
             }
 
-            // Send for analysis
-            s.results <- s.queueAnalysis(fullPath)
-
-            // Don't recurse into node_modules
-            continue
+            // Don't recurse into target directories
+            return fs.SkipDir
         }
 
-        // Recurse into subdirectories
-        s.walk(ctx, fullPath, depth+1)
+        // Continue traversing
+        return nil
+    })
+}
+
+// Helper to queue directory for analysis
+func (s *Scanner) queueAnalysis(path string) {
+    // Send path to worker pool
+    select {
+    case s.workQueue <- path:
+    default:
+        // Queue full, analyze inline
+        folder, err := s.analyzer.Analyze(path)
+        if err != nil {
+            s.errors <- fmt.Errorf("analyzing %s: %w", path, err)
+            return
+        }
+        s.results <- *folder
     }
 }
 
 func (s *Scanner) isTargetDir(name string) bool {
-    return name == "node_modules"
+    // Extensible for future dependency types
+    targetDirs := []string{
+        "node_modules", // JavaScript/TypeScript
+        "vendor",       // Go/PHP
+        ".venv",        // Python virtual environment
+        "venv",         // Python virtual environment
+        "target",       // Rust/Java
+    }
+
+    for _, target := range targetDirs {
+        if name == target {
+            return true
+        }
+    }
+    return false
+}
+
+// detectType determines the dependency folder type
+func (s *Scanner) detectType(name string) string {
+    typeMap := map[string]string{
+        "node_modules": "Node.js",
+        "vendor":       "Go/PHP",
+        ".venv":        "Python",
+        "venv":         "Python",
+        "target":       "Rust/Java",
+    }
+
+    if typ, ok := typeMap[name]; ok {
+        return typ
+    }
+    return "Unknown"
 }
 ```
 
