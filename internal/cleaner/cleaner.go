@@ -47,7 +47,7 @@ func (c *Cleaner) Clean(ctx context.Context, folders []models.DependencyFolder) 
 					Reason: err.Error(),
 				})
 				mu.Unlock()
-				
+
 				// Log deletion failure
 				if c.logger != nil {
 					c.logger.Error("Failed to delete folder", "path", f.Path, "error", err)
@@ -57,7 +57,7 @@ func (c *Cleaner) Clean(ctx context.Context, folders []models.DependencyFolder) 
 				result.DeletedFolders = append(result.DeletedFolders, f.Path)
 				result.SpaceReclaimed += f.Size
 				mu.Unlock()
-				
+
 				// Log successful deletion
 				if c.logger != nil {
 					c.logger.Info("Deleted folder", "path", f.Path, "size", f.Size)

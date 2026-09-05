@@ -90,19 +90,19 @@ func (m SelectionModel) View() string {
 			selectedCount--
 		}
 	}
-	
+
 	footer := "\n"
 	footer += "Selected: " + humanize.Bytes(uint64(m.totalSelected))
 	footer += " (" + humanize.Comma(int64(selectedCount)) + " folders)\n"
 	footer += "\nControls: [Space] Toggle  [Enter] Confirm  [q/Esc] Cancel\n"
-	
+
 	return m.table.View() + footer
 }
 
 func (m *SelectionModel) updateRow(idx int) {
 	// Get all current rows
 	rows := make([]table.Row, len(m.folders))
-	
+
 	// Rebuild all rows with updated selection states
 	for i, folder := range m.folders {
 		checkmark := "[ ]"
@@ -116,7 +116,7 @@ func (m *SelectionModel) updateRow(idx int) {
 			folder.Path,
 		}
 	}
-	
+
 	// Update the table with all rows
 	m.table.SetRows(rows)
 }
